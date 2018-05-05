@@ -1,8 +1,13 @@
 package errors
 
 import (
+	"errors"
 	"fmt"
 )
+
+func New(msg string) error {
+	return errors.New(msg)
+}
 
 type QueryError struct {
 	Message       string        `json:"message"`
