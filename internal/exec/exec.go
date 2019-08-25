@@ -40,19 +40,19 @@ func makePanicError(value interface{}) *errors.QueryError {
 	return errors.Errorf("graphql: panic occurred: %v", value)
 }
 
-func (r *Request) Execute(ctx context.Context, s *resolvable.Schema, op *query.Operation) ([]byte, []*errors.QueryError) {
+func (r *Request) Execute(ctx context.Context, s *resolvable.Schema, op *query.Operation) ([]byte, []*errors.QueryError, context.Context) {
 	var out bytes.Buffer
 	func() {
 		defer r.handlePanic(ctx)
 		sels := selected.ApplyOperation(&r.Request, s, op)
-		r.execSelections(ctx, sels, nil, s, s.Resolver, &out, op.Type == query.Mutation)
+		ctx = r.execSelections(ctx, sels, nil, s, s.Resolver, &out, op.Type == query.Mutation)
 	}()
 
 	if err := ctx.Err(); err != nil {
-		return nil, []*errors.QueryError{errors.Errorf("%s", err)}
+		return nil, []*errors.QueryError{errors.Errorf("%s", err)}, ctx
 	}
 
-	return out.Bytes(), r.Errs
+	return out.Bytes(), r.Errs, ctx
 }
 
 type fieldToExec struct {
@@ -66,16 +66,23 @@ func resolvedToNull(b *bytes.Buffer) bool {
 	return bytes.Equal(b.Bytes(), []byte("null"))
 }
 
-func (r *Request) execSelections(ctx context.Context, sels []selected.Selection, path *pathSegment, s *resolvable.Schema, resolver reflect.Value, out *bytes.Buffer, serially bool) {
+func (r *Request) execSelections(ctx context.Context, sels []selected.Selection, path *pathSegment, s *resolvable.Schema, resolver reflect.Value, out *bytes.Buffer, serially bool) context.Context {
 	async := !serially && selected.HasAsyncSel(sels)
 
 	var fields []*fieldToExec
 	collectFieldsToResolve(sels, s, resolver, &fields, make(map[string]*fieldToExec))
-
+	// 2019-8 External add: Support for getting path functions
+	mapFieldTrace := make(map[string]string)
+	if ctx.Value("mapFieldTrace") != nil {
+		mapFieldTrace, _ = ctx.Value("mapFieldTrace").(map[string]string)
+	}
 	if async {
 		var wg sync.WaitGroup
 		wg.Add(len(fields))
 		for _, f := range fields {
+			// 2019-8 External add: Support for getting path functions
+			mapFieldTrace[f.field.Name] = f.field.Field.TypeName + "." + f.field.Name
+			ctx = context.WithValue(ctx, "mapFieldTrace", mapFieldTrace)
 			go func(f *fieldToExec) {
 				defer wg.Done()
 				defer r.handlePanic(ctx)
@@ -99,7 +106,7 @@ func (r *Request) execSelections(ctx context.Context, sels []selected.Selection,
 		if _, ok := f.field.Type.(*common.NonNull); ok && resolvedToNull(f.out) {
 			out.Reset()
 			out.Write([]byte("null"))
-			return
+			return ctx
 		}
 
 		if i > 0 {
@@ -112,6 +119,7 @@ func (r *Request) execSelections(ctx context.Context, sels []selected.Selection,
 		out.Write(f.out.Bytes())
 	}
 	out.WriteByte('}')
+	return ctx
 }
 
 func collectFieldsToResolve(sels []selected.Selection, s *resolvable.Schema, resolver reflect.Value, fields *[]*fieldToExec, fieldByAlias map[string]*fieldToExec) {
